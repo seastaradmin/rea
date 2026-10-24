@@ -1,0 +1,84 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    # 00:17, 06:17, 12:17, and 18:17 UTC.
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+# contents: write lets GITHUB_TOKEN call merge-upstream. A PAT in SYNC_TOKEN
+# keeps its own scopes; this key does not narrow that token.
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream main
+    # Inert if this file is ever merged into another repository.
+    if: github.repository == 'seastaradmin/rea'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Merge morluto/rea main
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          parent="$(gh api "repos/${GH_REPO}" --jq '.parent.full_name // ""')"
+          if [[ "${parent}" != "morluto/rea" ]]; then
+            echo "::error::Refusing to sync because the fork parent is not morluto/rea."
+            printf 'Fork parent: %s\n' "${parent:-<none>}"
+            exit 1
+          fi
+
+          # merge-upstream fast-forwards when possible and creates a merge
+          # commit when this fork has its own commits. It never force-updates.
+          # HTTP 409 means a conflict; leave main unchanged.
+          stdout="$(mktemp)"
+          stderr="$(mktemp)"
+          if gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GH_REPO}/merge-upstream" \
+            -f branch="main" \
+            >"${stdout}" 2>"${stderr}"; then
+            status=0
+          else
+            status=$?
+          fi
+
+          echo "merge-upstream exit ${status}"
+          cat "${stdout}"
+          cat "${stderr}" >&2
+
+          if [[ "${status}" -eq 0 ]]; then
+            message="$(jq -r '.message // empty' "${stdout}" 2>/dev/null || true)"
+            merge_type="$(jq -r '.merge_type // empty' "${stdout}" 2>/dev/null || true)"
+            echo "merge_type=${merge_type:-unknown}"
+            {
+              echo "### Upstream sync"
+              echo
+              echo "- Parent: \`morluto/rea\`"
+              echo "- Branch: \`main\`"
+              echo "- Result: \`${merge_type:-unknown}\`"
+              echo "- Message: ${message:-"(see log)"}"
+            } >>"${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          detail="$(cat "${stdout}" "${stderr}")"
+          if grep -Eqi 'HTTP 409|Merge conflict' <<<"${detail}"; then
+            echo "::error::merge-upstream hit a merge conflict with morluto/rea:main (HTTP 409). main was not changed. This job does not force-push."
+          elif grep -Eqi 'workflows permission|\.github/workflows' <<<"${detail}"; then
+            echo "::error::merge-upstream refused to update .github/workflows. GITHUB_TOKEN cannot push those commits. Add a fine-grained PAT as secret SYNC_TOKEN with Contents read/write and Workflows read/write on this repository."
+          else
+            echo "::error::merge-upstream failed. main was not force-updated."
+          fi
+          exit "${status}"
